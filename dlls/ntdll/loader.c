@@ -40,6 +40,7 @@
 #include "wine/library.h"
 #include "wine/unicode.h"
 #include "wine/debug.h"
+#include "wine/list.h"
 #include "wine/server.h"
 #include "ntdll_misc.h"
 #include "ddk/wdm.h"
@@ -66,6 +67,15 @@ typedef void  (CALLBACK *LDRENUMPROC)(LDR_MODULE *, void *, BOOLEAN *);
 /* system directory with trailing backslash */
 const WCHAR system_dir[] = {'C',':','\\','w','i','n','d','o','w','s','\\',
                             's','y','s','t','e','m','3','2','\\',0};
+
+struct ldr_notification
+{
+    struct list                    entry;
+    PLDR_DLL_NOTIFICATION_FUNCTION callback;
+    void                           *context;
+};
+
+static struct list ldr_notifications = LIST_INIT( ldr_notifications );
 
 #define IS_OPTION_TRUE(ch) ((ch) == 'y' || (ch) == 'Y' || (ch) == 't' || (ch) == 'T' || (ch) == '1')
 
@@ -350,6 +360,29 @@ static ULONG_PTR allocate_stub( const char *dll, const char *name )
 static inline ULONG_PTR allocate_stub( const char *dll, const char *name ) { return 0xdeadbeef; }
 #endif  /* __i386__ */
 
+/* call ldr notifications */
+static void call_ldr_notifications( ULONG reason, LDR_MODULE *module )
+{
+    struct ldr_notification *notify, *notify_next;
+    LDR_DLL_NOTIFICATION_DATA data;
+
+    data.Loaded.Flags       = 0;
+    data.Loaded.FullDllName = &module->FullDllName;
+    data.Loaded.BaseDllName = &module->BaseDllName;
+    data.Loaded.DllBase     = module->BaseAddress;
+    data.Loaded.SizeOfImage = module->SizeOfImage;
+
+    LIST_FOR_EACH_ENTRY_SAFE( notify, notify_next, &ldr_notifications, struct ldr_notification, entry )
+    {
+        TRACE_(relay)("\1Call LDR notification callback (proc=%p,reason=%u,data=%p,context=%p)\n",
+                notify->callback, reason, &data, notify->context );
+
+        notify->callback(reason, &data, notify->context);
+
+        TRACE_(relay)("\1Ret  LDR notification callback (proc=%p,reason=%u,data=%p,context=%p)\n",
+                notify->callback, reason, &data, notify->context );
+    }
+}
 
 /*************************************************************************
  *      hash_basename
@@ -1334,16 +1367,23 @@ static NTSTATUS process_attach( WINE_MODREF *wm, LPVOID lpReserved )
     {
         WINE_MODREF *prev = current_modref;
         current_modref = wm;
+
+        call_ldr_notifications( LDR_DLL_NOTIFICATION_REASON_LOADED, &wm->ldr );
         status = MODULE_InitDLL( wm, DLL_PROCESS_ATTACH, lpReserved );
         if (status == STATUS_SUCCESS)
+        {
             wm->ldr.Flags |= LDR_PROCESS_ATTACHED;
+        }
         else
         {
             MODULE_InitDLL( wm, DLL_PROCESS_DETACH, lpReserved );
+            call_ldr_notifications( LDR_DLL_NOTIFICATION_REASON_UNLOADED, &wm->ldr );
+
             /* point to the name so LdrInitializeThunk can print it */
             last_failed_modref = wm;
             WARN("Initialization of %s failed\n", debugstr_w(wm->ldr.BaseDllName.Buffer));
         }
+
         current_modref = prev;
     }
 
@@ -1412,6 +1452,7 @@ static void process_detach(void)
             mod->Flags &= ~LDR_PROCESS_ATTACHED;
             MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr), 
                             DLL_PROCESS_DETACH, ULongToPtr(process_detaching) );
+            call_ldr_notifications( LDR_DLL_NOTIFICATION_REASON_UNLOADED, mod );
 
             /* Restart at head of WINE_MODREF list, as entries might have
                been added and/or removed while performing the call ... */
@@ -1526,8 +1567,27 @@ NTSTATUS WINAPI LdrEnumerateLoadedModules( void *unknown, LDRENUMPROC callback, 
 NTSTATUS WINAPI LdrRegisterDllNotification(ULONG flags, PLDR_DLL_NOTIFICATION_FUNCTION callback,
                                            void *context, void **cookie)
 {
-    FIXME( "(%04x, %p, %p, %p) stub\n", flags, callback, context, cookie );
-    return STATUS_NOT_IMPLEMENTED;
+    struct ldr_notification *notify;
+
+    TRACE( "(%x, %p, %p, %p)\n", flags, callback, context, cookie );
+
+    if (!callback || !cookie)
+        return STATUS_INVALID_PARAMETER;
+
+    if (flags)
+        FIXME( "ignoring flags %x\n", flags );
+
+    notify = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*notify) );
+    if (!notify) return STATUS_NO_MEMORY;
+    notify->callback = callback;
+    notify->context = context;
+
+    RtlEnterCriticalSection( &loader_section );
+    list_add_tail( &ldr_notifications, &notify->entry );
+    RtlLeaveCriticalSection( &loader_section );
+
+    *cookie = notify;
+    return STATUS_SUCCESS;
 }
 
 /******************************************************************
@@ -1535,8 +1595,18 @@ NTSTATUS WINAPI LdrRegisterDllNotification(ULONG flags, PLDR_DLL_NOTIFICATION_FU
  */
 NTSTATUS WINAPI LdrUnregisterDllNotification( void *cookie )
 {
-    FIXME( "(%p) stub\n", cookie );
-    return STATUS_NOT_IMPLEMENTED;
+    struct ldr_notification *notify = cookie;
+
+    TRACE( "(%p)\n", cookie );
+
+    if (!notify) return STATUS_INVALID_PARAMETER;
+
+    RtlEnterCriticalSection( &loader_section );
+    list_remove( &notify->entry );
+    RtlLeaveCriticalSection( &loader_section );
+
+    RtlFreeHeap( GetProcessHeap(), 0, notify );
+    return STATUS_SUCCESS;
 }
 
 /******************************************************************
@@ -2141,6 +2211,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, LPCWSTR name, LPCWSTR fakemo
     TRACE_(loaddll)( "Loaded %s at %p: native\n", debugstr_w(wm->ldr.FullDllName.Buffer), module );
 
     wm->ldr.LoadCount = 1;
+
     *pwm = wm;
     return STATUS_SUCCESS;
 }
